@@ -122,6 +122,28 @@ NSString *ErrorDescription(ErrorCode code) {
             return @"Failed sending legacy continue packet.";
         case LegacyContinueResponseFailed:
             return @"Failed reading legacy continue response.";
+        case DDIMountPathResolveFailed:
+            return @"Unable to resolve the DDI directory path.";
+        case DDIFileReadFailed:
+            return @"Failed to read required DDI files from disk.";
+        case ImageMounterConnectFailed:
+            return @"Failed to connect MobileImageMounter service.";
+        case DDIDeviceVersionReadFailed:
+            return @"Failed to read ProductVersion from lockdownd.";
+        case DDIDeviceVersionInvalid:
+            return @"Device ProductVersion format is invalid.";
+        case DDIMountStateQueryFailed:
+            return @"Failed to query current DDI mount state.";
+        case LegacyDDIMountFailed:
+            return @"Failed to mount legacy DeveloperDiskImage.";
+        case UniqueChipIDReadFailed:
+            return @"Failed to read UniqueChipID from lockdownd.";
+        case UniqueChipIDInvalid:
+            return @"UniqueChipID value is invalid.";
+        case ModernDDIMountFailed:
+            return @"Failed to mount personalized DDI image.";
+        case EndpointConnectivityLost:
+            return @"Lost TCP connectivity to the JIT debug endpoint.";
     }
     
     return @"Unknown error.";
@@ -143,6 +165,12 @@ ErrorGroup ErrorGroupForCode(ErrorCode code) {
         case DeviceProviderCreateFailed:
         case HeartbeatConnectFailed:
         case HeartbeatExchangeFailed:
+        case DDIMountPathResolveFailed:
+        case DDIFileReadFailed:
+        case ImageMounterConnectFailed:
+        case DDIDeviceVersionReadFailed:
+        case DDIDeviceVersionInvalid:
+        case EndpointConnectivityLost:
             return ErrorGroupSharedSetup;
         case ProcessControlCreateFailed:
         case CoreDeviceConnectFailed:
@@ -155,6 +183,9 @@ ErrorGroup ErrorGroupForCode(ErrorCode code) {
         case NoAckConfigureFailed:
         case AttachDebugProxyFailed:
         case SessionAllocationFailed:
+        case UniqueChipIDReadFailed:
+        case UniqueChipIDInvalid:
+        case ModernDDIMountFailed:
             return ErrorGroupModernPath;
         case LockdowndConnectFailed:
         case ProviderPairingFileFetchFailed:
@@ -166,6 +197,7 @@ ErrorGroup ErrorGroupForCode(ErrorCode code) {
         case LegacySocketInvalidAddress:
         case LegacySocketConnectFailed:
         case LegacySocketTLSSetupFailed:
+        case LegacyDDIMountFailed:
             return ErrorGroupLegacyPath;
         case LegacyTLSConfigurationFailed:
         case LegacyTLSConnectionMissing:
@@ -189,6 +221,7 @@ ErrorGroup ErrorGroupForCode(ErrorCode code) {
         case LegacyDebugCommandResponseFailed:
         case LegacyContinuePacketFailed:
         case LegacyContinueResponseFailed:
+        case DDIMountStateQueryFailed:
             return ErrorGroupProtocol;
     }
     

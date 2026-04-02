@@ -15,9 +15,12 @@ cd "$ROOT_DIR"
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-TODAY=$(date +%Y%b%d | tr '[:lower:]' '[:upper:]')
 cp "$XCCONFIG_PATH" "$DIST_DIR/Reynard.xcconfig"
-sed -i '' "s/CURRENT_BUILD = .*/CURRENT_BUILD = $TODAY/" "$DIST_DIR/Reynard.xcconfig"
+
+BUILD_SHA=$(git -C "$ROOT_DIR" rev-parse --short HEAD)
+GECKO_VERSION=$(tr -d '\000\r' < "$ROOT_DIR/engine/release.txt" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+sed -i '' "s/CURRENT_BUILD = .*/CURRENT_BUILD = $BUILD_SHA/" "$DIST_DIR/Reynard.xcconfig"
+sed -i '' "s/GECKO_VERSION = .*/GECKO_VERSION = $GECKO_VERSION/" "$DIST_DIR/Reynard.xcconfig"
 
 xcodebuild clean -scheme "Reynard" -project "$PROJECT_PATH" -sdk iphoneos -arch arm64 -configuration Release
 

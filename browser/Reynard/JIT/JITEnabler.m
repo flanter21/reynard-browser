@@ -13,8 +13,12 @@
 
 @property(nonatomic, assign) DeviceProvider *sharedProvider;
 @property(nonatomic, strong) dispatch_queue_t providerQueue;
+@property(nonatomic, assign) BOOL didEnsureDDIMounted;
+@property(nonatomic, strong) dispatch_source_t ddiMountedMonitor;
 
 - (DeviceProvider *)getProvider:(NSError **)error;
+- (void)startDDIMonitor;
+- (void)stopDDIMonitor;
 
 @end
 
@@ -34,6 +38,8 @@
     if (self) {
         _sharedProvider = NULL;
         _providerQueue = dispatch_queue_create("me.minh-ton.jit.enabler.provider", DISPATCH_QUEUE_SERIAL);
+        _didEnsureDDIMounted = NO;
+        _ddiMountedMonitor = nil;
     }
     return self;
 }
@@ -88,6 +94,8 @@
         
         logger([NSString stringWithFormat:@"Attach response for pid %d: %@", pid, attachResponse.length > 0 ? @"<stop packet>" : @"<no response>"], logHandler);
         
+        registerJITEndpointForPID(pid, @"10.7.0.1", 62078, -1);
+        
         DebugSession *persistentSession = malloc(sizeof(*persistentSession));
         if (!persistentSession) {
             freeDebugSession(&session);
@@ -140,6 +148,8 @@
         
         logger([NSString stringWithFormat:@"Legacy attach response for pid %d: %@", pid, attachResponse.length > 0 ? attachResponse : @"<no response>"], logHandler);
         
+        registerJITEndpointForPID(pid, @"10.7.0.1", debugPort, legacySession->connection.socketFD);
+        
         DeviceLogHandler copiedHandler = [logHandler copy];
         dispatch_async(debugServiceQueue(), ^{
             runLegacyDebugService(pid, legacySession, copiedHandler);
@@ -154,6 +164,7 @@
 }
 
 - (void)detachAllJITSessions {
+    resetJITEndpointMonitor();
     dispatch_sync(debugSessionStateQueue(), ^{
         NSMutableSet<NSNumber *> *active = activeDebugSessionPIDs();
         NSMutableSet<NSNumber *> *detachRequested = detachRequestedDebugSessionPIDs();
@@ -164,8 +175,22 @@
 - (DeviceProvider *)getProvider:(NSError **)error {
     __block DeviceProvider *provider = NULL;
     __block NSError *providerError = nil;
+    
     dispatch_sync(self.providerQueue, ^{
-        if (!self.sharedProvider) self.sharedProvider = createDeviceProvider([self pairingFilePath], @"10.7.0.1", &providerError);
+        if (!self.sharedProvider) {
+            self.sharedProvider = createDeviceProvider(pairingFilePath(), @"10.7.0.1", &providerError);
+            self.didEnsureDDIMounted = NO;
+        }
+        
+        if (self.sharedProvider && !self.didEnsureDDIMounted) {
+            if (!ensureDDIMounted(self.sharedProvider, &providerError)) {
+                provider = NULL;
+                return;
+            }
+            self.didEnsureDDIMounted = YES;
+            [self startDDIMonitor];
+        }
+        
         provider = self.sharedProvider;
     });
     
@@ -173,16 +198,47 @@
     return provider;
 }
 
+- (void)startDDIMonitor {
+    if (self.ddiMountedMonitor) return;
+    
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.providerQueue);
+    if (!timer) return;
+    
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, 0);
+    
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!strongSelf.sharedProvider || !strongSelf.didEnsureDDIMounted) return;
+        
+        size_t mountedDeviceCount = getMountedDeviceCount(strongSelf.sharedProvider);
+        if (mountedDeviceCount > 0) return;
+        
+        [strongSelf stopDDIMonitor];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"me-minh-ton.jit.ddimonitor" object:nil userInfo:nil];
+        });
+    });
+    
+    self.ddiMountedMonitor = timer;
+    dispatch_resume(timer);
+}
+
+- (void)stopDDIMonitor {
+    if (!self.ddiMountedMonitor) return;
+    dispatch_source_cancel(self.ddiMountedMonitor);
+    self.ddiMountedMonitor = nil;
+}
+
 - (void)dealloc {
+    resetJITEndpointMonitor();
+    [self stopDDIMonitor];
     if (_sharedProvider) {
         freeDeviceProvider(_sharedProvider);
         _sharedProvider = NULL;
     }
-}
-
-- (NSString *)pairingFilePath {
-    NSURL *documentsDirectory = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
-    return [[documentsDirectory URLByAppendingPathComponent:@"pairingFile.plist"] path];
 }
 
 @end

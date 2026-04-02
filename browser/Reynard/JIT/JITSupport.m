@@ -13,6 +13,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
 
@@ -28,6 +31,10 @@ struct DeviceProvider {
     BOOL heartbeatRunning;
 };
 
+static dispatch_source_t endpointMonitorTimer = nil;
+static NSUInteger endpointMonitorCursor = 0;
+static BOOL endpointFailureLatched = NO;
+
 dispatch_queue_t debugServiceQueue(void) {
     static dispatch_queue_t queue;
     static dispatch_once_t onceToken;
@@ -42,6 +49,15 @@ dispatch_queue_t debugSessionStateQueue(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         queue = dispatch_queue_create("me.minh-ton.jit.debug-service-state", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static dispatch_queue_t endpointMonitorQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("me.minh-ton.jit.endpoint-monitor", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
@@ -429,6 +445,7 @@ void runDebugService(int32_t pid, DebugSession *session, DeviceLogHandler logHan
     }
     
     unregisterDebugSessionPID(pid);
+    unregisterJITEndpointForPID(pid);
     freeDebugSession(session);
     free(session);
 }
@@ -1058,7 +1075,507 @@ void runLegacyDebugService(int32_t pid, LegacyDebugSession *session, DeviceLogHa
     if (!exitPacketPresent && !detachedByCommand) detachedByCommand = detachLegacyDebuggerSession(&session->connection, pid, logHandler);
     
     unregisterDebugSessionPID(pid);
+    unregisterJITEndpointForPID(pid);
     closeLegacyDebugConnection(&session->connection);
     free(session);
 }
 
+// MARK: Developer Disk Image Mounting
+
+// There's actually a pretty helpful example from the 'idevice' submodule for this
+// at ./support/idevice/cpp/examples/mounter.cpp, so I just ended up copying most
+// of the logic from there with only a few modifications here.
+
+static NSURL *ddiDirectoryURL(NSError **error) {
+    NSURL *documentsDirectory = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    if (!documentsDirectory) {
+        if (error) *error = MakeError(DDIMountPathResolveFailed);
+        return nil;
+    }
+    
+    return [documentsDirectory URLByAppendingPathComponent:@"DDI" isDirectory:YES];
+}
+
+static NSData *ddiFileData(NSURL *ddiDirectory, NSString *fileName, NSError **error) {
+    NSURL *fileURL = [ddiDirectory URLByAppendingPathComponent:fileName isDirectory:NO];
+    NSError *readError = nil;
+    NSData *data = [NSData dataWithContentsOfURL:fileURL options:NSDataReadingMappedIfSafe error:&readError];
+    if (!data || data.length == 0) {
+        if (error) *error = MakeError(DDIFileReadFailed);
+        return nil;
+    }
+    return data;
+}
+
+static BOOL isImageMounted(ImageMounterHandle *mounterClient, const char *imageType, BOOL *mountedOut, NSError **error) {
+    uint8_t *signature = NULL;
+    size_t signatureLength = 0;
+    
+    IdeviceFfiError *ffiError = image_mounter_lookup_image(mounterClient, imageType, &signature, &signatureLength);
+    if (!ffiError) {
+        if (signature) idevice_data_free(signature, signatureLength);
+        if (mountedOut) *mountedOut = YES;
+        return YES;
+    }
+    
+    BOOL notFound = ffiError->code == -14;
+    idevice_error_free(ffiError);
+    
+    if (notFound) {
+        if (mountedOut) *mountedOut = NO;
+        return YES;
+    }
+    
+    if (error) *error = MakeError(DDIMountStateQueryFailed);
+    return NO;
+}
+
+BOOL ensureDDIMounted(DeviceProvider *provider, NSError **error) {
+    if (!provider || !provider->handle) {
+        if (error) *error = MakeError(DeviceProviderCreateFailed);
+        return NO;
+    }
+    
+    NSURL *ddiDirectory = ddiDirectoryURL(error);
+    if (!ddiDirectory) return NO;
+    
+    LockdowndClientHandle *lockdownClient = NULL;
+    IdevicePairingFile *pairingFile = NULL;
+    ImageMounterHandle *mounterClient = NULL;
+    IdeviceFfiError *ffiError = NULL;
+    plist_t versionNode = NULL;
+    plist_t chipIDNode = NULL;
+    char *versionCString = NULL;
+    NSString *versionString = nil;
+    NSInteger majorVersion = 0;
+    const char *imageType = NULL;
+    BOOL mounted = NO;
+    NSData *legacyImageData = nil;
+    NSData *legacySignatureData = nil;
+    NSData *modernImageData = nil;
+    NSData *modernTrustCacheData = nil;
+    NSData *modernBuildManifestData = nil;
+    uint64_t uniqueChipID = 0;
+    BOOL success = NO;
+    
+    ffiError = lockdownd_connect(provider->handle, &lockdownClient);
+    if (ffiError) {
+        if (error) *error = MakeError(LockdowndConnectFailed);
+        idevice_error_free(ffiError);
+        goto cleanup;
+    }
+    
+    ffiError = idevice_provider_get_pairing_file(provider->handle, &pairingFile);
+    if (ffiError) {
+        if (error) *error = MakeError(ProviderPairingFileFetchFailed);
+        idevice_error_free(ffiError);
+        goto cleanup;
+    }
+    
+    ffiError = lockdownd_start_session(lockdownClient, pairingFile);
+    if (ffiError) {
+        if (error) *error = MakeError(LockdowndSessionStartFailed);
+        idevice_error_free(ffiError);
+        goto cleanup;
+    }
+    
+    ffiError = lockdownd_get_value(lockdownClient, "ProductVersion", NULL, &versionNode);
+    if (ffiError) {
+        if (error) *error = MakeError(DDIDeviceVersionReadFailed);
+        idevice_error_free(ffiError);
+        goto cleanup;
+    }
+    
+    plist_get_string_val(versionNode, &versionCString);
+    if (!versionCString) {
+        if (error) *error = MakeError(DDIDeviceVersionInvalid);
+        goto cleanup;
+    }
+    
+    versionString = [NSString stringWithUTF8String:versionCString] ?: @"";
+    majorVersion = versionString.integerValue;
+    if (majorVersion <= 0) {
+        if (error) *error = MakeError(DDIDeviceVersionInvalid);
+        goto cleanup;
+    }
+    
+    ffiError = image_mounter_connect(provider->handle, &mounterClient);
+    if (ffiError) {
+        if (error) *error = MakeError(ImageMounterConnectFailed);
+        idevice_error_free(ffiError);
+        goto cleanup;
+    }
+    
+    imageType = majorVersion < 17 ? "Developer" : "Personalized";
+    if (!isImageMounted(mounterClient, imageType, &mounted, error)) {
+        goto cleanup;
+    }
+    
+    if (mounted) {
+        success = YES;
+        goto cleanup;
+    }
+    
+    if (majorVersion < 17) {
+        legacyImageData = ddiFileData(ddiDirectory, @"DeveloperDiskImage.dmg", error);
+        if (!legacyImageData) goto cleanup;
+        
+        legacySignatureData = ddiFileData(ddiDirectory, @"DeveloperDiskImage.dmg.signature", error);
+        if (!legacySignatureData) goto cleanup;
+        
+        ffiError = image_mounter_mount_developer(mounterClient, legacyImageData.bytes, legacyImageData.length, legacySignatureData.bytes, legacySignatureData.length);
+        if (ffiError) {
+            if (error) *error = MakeError(LegacyDDIMountFailed);
+            idevice_error_free(ffiError);
+            goto cleanup;
+        }
+        
+        success = YES;
+        goto cleanup;
+    }
+    
+    modernImageData = ddiFileData(ddiDirectory, @"Image.dmg", error);
+    if (!modernImageData) goto cleanup;
+    
+    modernTrustCacheData = ddiFileData(ddiDirectory, @"Image.dmg.trustcache", error);
+    if (!modernTrustCacheData) goto cleanup;
+    
+    modernBuildManifestData = ddiFileData(ddiDirectory, @"BuildManifest.plist", error);
+    if (!modernBuildManifestData) goto cleanup;
+    
+    ffiError = lockdownd_get_value(lockdownClient, "UniqueChipID", NULL, &chipIDNode);
+    if (ffiError) {
+        if (error) *error = MakeError(UniqueChipIDReadFailed);
+        idevice_error_free(ffiError);
+        goto cleanup;
+    }
+    
+    plist_get_uint_val(chipIDNode, &uniqueChipID);
+    if (uniqueChipID == 0) {
+        if (error) *error = MakeError(UniqueChipIDInvalid);
+        goto cleanup;
+    }
+    
+    ffiError = image_mounter_mount_personalized(mounterClient, provider->handle, modernImageData.bytes, modernImageData.length, modernTrustCacheData.bytes, modernTrustCacheData.length, modernBuildManifestData.bytes, modernBuildManifestData.length, NULL, uniqueChipID);
+    
+    if (ffiError) {
+        if (error) *error = MakeError(ModernDDIMountFailed);
+        idevice_error_free(ffiError);
+        goto cleanup;
+    }
+    
+    success = YES;
+    
+cleanup:
+    if (versionCString) free(versionCString);
+    if (chipIDNode) plist_free(chipIDNode);
+    if (versionNode) plist_free(versionNode);
+    if (mounterClient) image_mounter_free(mounterClient);
+    if (pairingFile) idevice_pairing_file_free(pairingFile);
+    if (lockdownClient) lockdownd_client_free(lockdownClient);
+    return success;
+}
+
+// From StikDebug
+size_t getMountedDeviceCount(DeviceProvider *provider) {
+    if (!provider || !provider->handle) {
+        logger(@"getMountedDeviceCount failed: missing provider handle", nil);
+        return 0;
+    }
+    
+    ImageMounterHandle *client = NULL;
+    IdeviceFfiError *ffiError = image_mounter_connect(provider->handle, &client);
+    if (ffiError) {
+        if (ffiError->message) logger([NSString stringWithFormat:@"getMountedDeviceCount image_mounter_connect failed: %s", ffiError->message], nil);
+        idevice_error_free(ffiError);
+        return 0;
+    }
+    
+    plist_t *devices = NULL;
+    size_t deviceLength = 0;
+    ffiError = image_mounter_copy_devices(client, &devices, &deviceLength);
+    image_mounter_free(client);
+    if (ffiError) {
+        if (ffiError->message) logger([NSString stringWithFormat:@"getMountedDeviceCount image_mounter_copy_devices failed: %s", ffiError->message], nil);
+        idevice_error_free(ffiError);
+        return 0;
+    }
+    
+    for (size_t i = 0; i < deviceLength; i++) if (devices[i]) plist_free(devices[i]);
+    if (devices) idevice_data_free((uint8_t *)devices, deviceLength * sizeof(plist_t));
+    
+    return deviceLength;
+}
+
+// MARK: Endpoint Connectivity Monitoring
+
+static NSMutableDictionary<NSNumber *, NSDictionary<NSString *, id> *> *monitoredEndpointsByPID(void) {
+    static NSMutableDictionary<NSNumber *, NSDictionary<NSString *, id> *> *endpoints;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        endpoints = [NSMutableDictionary dictionary];
+    });
+    return endpoints;
+}
+
+static NSMutableDictionary<NSString *, NSNumber *> *endpointFailureCounts(void) {
+    static NSMutableDictionary<NSString *, NSNumber *> *failureCounts;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        failureCounts = [NSMutableDictionary dictionary];
+    });
+    return failureCounts;
+}
+
+static void stopEndpointMonitorLocked(void) {
+    if (!endpointMonitorTimer) return;
+    dispatch_source_cancel(endpointMonitorTimer);
+    endpointMonitorTimer = nil;
+}
+
+static BOOL probeTCPEndpoint(NSString *targetAddress, uint16_t port, NSTimeInterval timeoutSeconds, int *errorCodeOut) {
+    if (errorCodeOut) *errorCodeOut = 0;
+    
+    int socketFD = socket(AF_INET, SOCK_STREAM, 0);
+    if (socketFD < 0) {
+        if (errorCodeOut) *errorCodeOut = errno;
+        return NO;
+    }
+    
+    int noSigPipe = 1;
+    setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));
+    
+    int noDelay = 1;
+    setsockopt(socketFD, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+    
+    int flags = fcntl(socketFD, F_GETFL, 0);
+    if (flags < 0 || fcntl(socketFD, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(socketFD);
+        if (errorCodeOut) *errorCodeOut = errno;
+        return NO;
+    }
+    
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    
+    if (inet_pton(AF_INET, targetAddress.UTF8String, &address.sin_addr) != 1) {
+        close(socketFD);
+        if (errorCodeOut) *errorCodeOut = EINVAL;
+        return NO;
+    }
+    
+    int connectResult = connect(socketFD, (const struct sockaddr *)&address, sizeof(address));
+    if (connectResult == 0) {
+        close(socketFD);
+        return YES;
+    }
+    
+    if (errno != EINPROGRESS) {
+        if (errorCodeOut) *errorCodeOut = errno;
+        close(socketFD);
+        return NO;
+    }
+    
+    struct timeval timeoutValue;
+    timeoutValue.tv_sec = (time_t)timeoutSeconds;
+    timeoutValue.tv_usec = (suseconds_t)((timeoutSeconds - timeoutValue.tv_sec) * 1000000.0);
+    
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(socketFD, &writeSet);
+    
+    int selectResult = select(socketFD + 1, NULL, &writeSet, NULL, &timeoutValue);
+    if (selectResult <= 0) {
+        if (errorCodeOut) *errorCodeOut = (selectResult == 0 ? ETIMEDOUT : errno);
+        close(socketFD);
+        return NO;
+    }
+    
+    int socketError = 0;
+    socklen_t socketErrorLength = sizeof(socketError);
+    if (getsockopt(socketFD, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLength) != 0) {
+        if (errorCodeOut) *errorCodeOut = errno;
+        close(socketFD);
+        return NO;
+    }
+    
+    close(socketFD);
+    
+    if (socketError != 0 && errorCodeOut) *errorCodeOut = socketError;
+    return socketError == 0;
+}
+
+static BOOL legacyEndpointSocketHealthy(int socketFD) {
+    if (socketFD < 0) return NO;
+    
+    int socketError = 0;
+    socklen_t socketErrorLength = sizeof(socketError);
+    if (getsockopt(socketFD, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLength) != 0) return NO;
+    if (socketError != 0) return NO;
+    
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = socketFD;
+    pfd.events = POLLIN | POLLOUT | POLLERR | POLLHUP;
+    
+    int pollResult = poll(&pfd, 1, 0);
+    if (pollResult < 0) return NO;
+    if (pollResult > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return NO;
+    
+    if (pollResult > 0 && (pfd.revents & POLLIN)) {
+        char peekByte = 0;
+        ssize_t peekResult = recv(socketFD, &peekByte, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (peekResult == 0) return NO;
+        if (peekResult < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return NO;
+    }
+    
+    return YES;
+}
+
+static NSDictionary<NSString *, id> *endpointEntryForKey(NSString *endpointKey, NSNumber **pidOut) {
+    __block NSDictionary<NSString *, id> *matchedEntry = nil;
+    __block NSNumber *matchedPID = nil;
+    
+    [monitoredEndpointsByPID()
+     enumerateKeysAndObjectsUsingBlock:^(NSNumber * _Nonnull pid, NSDictionary<NSString *, id> * _Nonnull entry, BOOL * _Nonnull stop) {
+        NSString *candidateKey = entry[@"key"];
+        if (![candidateKey isEqualToString:endpointKey]) return;
+        matchedEntry = entry;
+        matchedPID = pid;
+        *stop = YES;
+    }];
+    
+    if (pidOut) *pidOut = matchedPID;
+    return matchedEntry;
+}
+
+static void postEndpointConnectivityFailure(NSNumber *pid, NSString *targetAddress, NSNumber *portNumber, NSError *error) {
+    NSMutableDictionary *userInfo = [NSMutableDictionary dictionaryWithCapacity:4];
+    if (pid) userInfo[@"pid"] = pid;
+    if (targetAddress) userInfo[@"address"] = targetAddress;
+    if (portNumber) userInfo[@"port"] = portNumber;
+    if (error) userInfo[@"error"] = error;
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"me-minh-ton.jit.endpoint-monitor-failed" object:nil userInfo:userInfo];
+    });
+}
+
+static void performEndpointMonitorTick(void) {
+    NSDictionary<NSNumber *, NSDictionary<NSString *, id> *> *entriesByPID = monitoredEndpointsByPID();
+    if (entriesByPID.count == 0) {
+        [endpointFailureCounts() removeAllObjects];
+        endpointMonitorCursor = 0;
+        stopEndpointMonitorLocked();
+        return;
+    }
+    
+    NSMutableOrderedSet<NSString *> *uniqueEndpointKeys = [NSMutableOrderedSet orderedSet];
+    for (NSDictionary<NSString *, id> *entry in entriesByPID.allValues) {
+        NSString *endpointKey = entry[@"key"];
+        if (endpointKey.length > 0) [uniqueEndpointKeys addObject:endpointKey];
+    }
+    
+    if (uniqueEndpointKeys.count == 0) return;
+    if (endpointMonitorCursor >= uniqueEndpointKeys.count) endpointMonitorCursor = 0;
+    
+    NSString *endpointKey = uniqueEndpointKeys[endpointMonitorCursor];
+    endpointMonitorCursor = (endpointMonitorCursor + 1) % uniqueEndpointKeys.count;
+    
+    NSNumber *samplePID = nil;
+    NSDictionary<NSString *, id> *endpointEntry = endpointEntryForKey(endpointKey, &samplePID);
+    NSString *targetAddress = endpointEntry[@"address"];
+    NSNumber *portNumber = endpointEntry[@"port"];
+    
+    if (targetAddress.length == 0 || !portNumber) return;
+    
+    uint16_t port = (uint16_t)portNumber.unsignedShortValue;
+    NSNumber *socketNumber = endpointEntry[@"socketFD"];
+    int socketFD = socketNumber ? socketNumber.intValue : -1;
+    
+    BOOL endpointHealthy = NO;
+    if (socketFD >= 0) {
+        int legacyProbeError = 0;
+        BOOL legacyProbeReachable = probeTCPEndpoint(targetAddress, port, 0.35, &legacyProbeError);
+        BOOL legacyProbeHealthy = legacyProbeReachable || legacyProbeError == ECONNREFUSED || legacyProbeError == EADDRINUSE;
+        endpointHealthy = legacyEndpointSocketHealthy(socketFD) && legacyProbeHealthy;
+    } else {
+        endpointHealthy = probeTCPEndpoint(targetAddress, port, 0.35, NULL);
+    }
+    
+    if (endpointHealthy) {
+        [endpointFailureCounts() removeObjectForKey:endpointKey];
+        return;
+    }
+    
+    NSMutableDictionary<NSString *, NSNumber *> *failureCounts = endpointFailureCounts();
+    NSUInteger failureCount = [failureCounts[endpointKey] unsignedIntegerValue] + 1;
+    failureCounts[endpointKey] = @(failureCount);
+    
+    NSUInteger requiredFailures = socketFD >= 0 ? 1 : 2;
+    if (failureCount < requiredFailures) return;
+    
+    endpointFailureLatched = YES;
+    stopEndpointMonitorLocked();
+    
+    NSError *connectivityError = MakeError(EndpointConnectivityLost);
+    postEndpointConnectivityFailure(samplePID, targetAddress, portNumber, connectivityError);
+}
+
+static void startEndpointMonitorLocked(void) {
+    if (endpointMonitorTimer || endpointFailureLatched) return;
+    
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, endpointMonitorQueue());
+    if (!timer) return;
+    
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)NSEC_PER_SEC, NSEC_PER_MSEC * 100);
+    dispatch_source_set_event_handler(timer, ^{
+        performEndpointMonitorTick();
+    });
+    
+    endpointMonitorTimer = timer;
+    dispatch_resume(timer);
+}
+
+void registerJITEndpointForPID(int32_t pid, NSString *targetAddress, uint16_t port, int socketFD) {
+    if (pid <= 0 || targetAddress.length == 0 || port == 0) return;
+    
+    dispatch_async(endpointMonitorQueue(), ^{
+        NSString *endpointKey = [NSString stringWithFormat:@"%@:%u", targetAddress, port];
+        monitoredEndpointsByPID()[@(pid)] = @{
+            @"key": endpointKey,
+            @"address": [targetAddress copy],
+            @"port": @(port),
+            @"socketFD": @(socketFD),
+        };
+        
+        [endpointFailureCounts() removeObjectForKey:endpointKey];
+        startEndpointMonitorLocked();
+    });
+}
+
+void unregisterJITEndpointForPID(int32_t pid) {
+    if (pid <= 0) return;
+    
+    dispatch_async(endpointMonitorQueue(), ^{
+        [monitoredEndpointsByPID() removeObjectForKey:@(pid)];
+        
+        if (monitoredEndpointsByPID().count == 0) {
+            [endpointFailureCounts() removeAllObjects];
+            endpointMonitorCursor = 0;
+            stopEndpointMonitorLocked();
+        }
+    });
+}
+
+void resetJITEndpointMonitor(void) {
+    dispatch_sync(endpointMonitorQueue(), ^{
+        [monitoredEndpointsByPID() removeAllObjects];
+        [endpointFailureCounts() removeAllObjects];
+        endpointMonitorCursor = 0;
+        endpointFailureLatched = NO;
+        stopEndpointMonitorLocked();
+    });
+}
